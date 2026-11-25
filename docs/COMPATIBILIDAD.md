@@ -51,8 +51,8 @@ Falta probar en el teléfono: importar desde Archivos, persistir en OPFS, sobrev
 | Indicador de carga del modelo | Verificado en Chromium y WebKit Linux |
 | Respuesta en vivo y tokens/s | Verificado en Chromium y WebKit Linux |
 | Botón Parar | Verificado en Chromium y WebKit Linux |
-| PWA: manifest, service worker, offline | Verificado a nivel de archivos y registro del SW en el navegador de prueba. Offline real y URL pública: se confirma al publicar |
-| HTTPS | Queda verificado cuando GitHub Pages publique la URL |
+| PWA: manifest, service worker, offline | Verificado a nivel de archivos y registro del SW en el navegador de prueba. Offline en la URL pública: no verificado (el sitio aún no está publicado) |
+| HTTPS / URL pública | **No verificado.** El job de *build* en Actions sí funcionó (25 nov 2026, ~01:47 hora de Uruguay). El *deploy* falló: GitHub respondió 404 y pidió activar Pages en https://github.com/marceloko24/chatlm/settings/pages. La URL prevista https://marceloko24.github.io/chatlm/ devolvía 404 al momento de este informe |
 | COOP/COEP | No aplican (build de un hilo, sin SharedArrayBuffer) |
 | WebGPU | No se usa, a propósito |
 | Instrucciones «Agregar a inicio» | Están en la app y en el README, en español. El gesto en el iPhone no está verificado |

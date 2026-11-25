@@ -8,11 +8,21 @@ Las conversaciones no se envían a ningún servidor. El sitio solo entrega los a
 
 ## Probarla en Safari
 
-Cuando GitHub Pages termine de publicar:
+La URL prevista es:
 
 **https://marceloko24.github.io/chatlm/**
 
-1. Abrí ese enlace en **Safari** (no en una pestaña privada).
+Todavía no está en línea. El código ya está en [github.com/marceloko24/chatlm](https://github.com/marceloko24/chatlm) y el *build* de GitHub Actions terminó bien (25 de noviembre de 2026, ~01:47 hora de Uruguay). El *deploy* falló porque GitHub Pages no está activado en el repositorio; el conector no puede cambiar esa opción.
+
+Activación (una sola vez, en el iPhone, ya entrado a GitHub; no hace falta compartir contraseña ni un código):
+
+1. Abrí [la configuración de Pages del repo](https://github.com/marceloko24/chatlm/settings/pages).
+2. En *Build and deployment* → *Source*, elegí **GitHub Actions** y guardá.
+3. En la pestaña Actions, re-ejecutá el flujo *pages* (o avisá y lo re-ejecutamos).
+
+Cuando la URL responda:
+
+1. Abrila en **Safari** (no en una pestaña privada).
 2. Importá el archivo `Qwen2.5-0.5B-Instruct-Q4_K_M.gguf` desde Archivos. El modelo no se sube: queda en el teléfono.
 3. Cuando termine de cargar, escribí un mensaje en español.
 
