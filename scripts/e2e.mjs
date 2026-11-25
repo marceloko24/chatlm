@@ -17,6 +17,9 @@ async function waitStatus(page, test, timeout = 180000) {
   while (Date.now() - start < timeout) {
     const text = ((await page.locator('#status').textContent()) || '').trim();
     if (text) last = text;
+    if (/Unreachable code|resume\(\)|already exited|go_scheduler/i.test(text)) {
+      throw new Error('status trap: ' + text);
+    }
     if (/Se quedó sin memoria|No se pudo cargar el modelo|No se pudo iniciar|No se pudo crear/i.test(text)) {
       throw new Error('status error: ' + text);
     }
@@ -47,6 +50,7 @@ async function run(name, browserType) {
     deviceScaleFactor: 2,
   });
   const page = await context.newPage();
+  page.setDefaultTimeout(180000);
   const logs = [];
   page.on('console', (msg) => logs.push(`[${msg.type()}] ${msg.text()}`));
   page.on('pageerror', (err) => logs.push(`[pageerror] ${err.message}`));
@@ -71,19 +75,32 @@ async function run(name, browserType) {
     await page.waitForFunction(() => {
       const msgs = document.querySelectorAll('#transcript .msg.assistant');
       return msgs.length > 0 && (msgs[msgs.length - 1].textContent || '').trim().length > 0;
-    }, { timeout: 180000 });
+    }, undefined, { timeout: 180000 });
     result.checks.streaming = true;
 
     await page.waitForFunction(() => {
       const status = ((document.getElementById('status') || {}).textContent || '').trim();
       const stop = document.getElementById('stop');
       return status === 'Listo.' && stop && stop.hidden;
-    }, { timeout: 180000 });
+    }, undefined, { timeout: 180000 });
     result.doneText = ((await page.locator('#speed').textContent()) || '').trim();
     result.reply = await page.locator('#transcript .msg.assistant').last().textContent();
     result.checks.generation = !!(result.reply && result.reply.trim());
     result.checks.tokensPerSecond = /tokens\/s/i.test(result.doneText || '');
+    result.checks.labelNot1B = /0\.5B/i.test(result.loadedText || '') && !/\b1B\b/.test(result.loadedText || '');
     await page.screenshot({ path: path.join(SHOTS, `${name}-03-chat.png`), fullPage: true });
+
+    // Second generation in the same session (the iPhone trap often appeared here).
+    await page.fill('#prompt', PROMPT);
+    await page.click('#send');
+    await page.waitForFunction(() => {
+      const status = ((document.getElementById('status') || {}).textContent || '').trim();
+      const stop = document.getElementById('stop');
+      return status === 'Listo.' && stop && stop.hidden;
+    }, undefined, { timeout: 180000 });
+    result.secondDoneText = ((await page.locator('#speed').textContent()) || '').trim();
+    result.secondReply = await page.locator('#transcript .msg.assistant').last().textContent();
+    result.checks.secondGeneration = /tokens\/s/i.test(result.secondDoneText || '') && !!(result.secondReply && result.secondReply.trim());
 
     // Reload and load from OPFS
     await page.reload({ waitUntil: 'networkidle' });
@@ -111,7 +128,7 @@ async function run(name, browserType) {
     await page.waitForFunction(() => {
       const msgs = document.querySelectorAll('#transcript .msg.assistant');
       return msgs.length > 0;
-    }, { timeout: 120000 }).catch(() => {});
+    }, undefined, { timeout: 120000 }).catch(() => {});
     await page.waitForTimeout(600);
     const stopVisible = await page.locator('#stop').isVisible();
     if (stopVisible) {
@@ -119,12 +136,27 @@ async function run(name, browserType) {
       await page.waitForFunction(() => {
         const stop = document.getElementById('stop');
         return stop && stop.hidden;
-      }, { timeout: 180000 });
+      }, undefined, { timeout: 180000 });
     }
     result.checks.stop = true;
     result.stopText = ((await page.locator('#speed').textContent()) || '').trim();
     result.checks.stop = /detenido|tokens/i.test(result.stopText) || true;
     await page.screenshot({ path: path.join(SHOTS, `${name}-04-after-stop.png`), fullPage: true });
+
+    // Nueva charla, then another short reply
+    if (await page.locator('#reset').isEnabled()) {
+      await page.click('#reset');
+      await page.waitForFunction(() => /Nueva charla/i.test((document.getElementById('status') || {}).textContent || ''), { timeout: 10000 });
+      result.checks.newChat = true;
+    }
+
+    // Clicking load-saved again must not trap (same instance, already loaded).
+    if (await page.locator('#load-saved').isVisible()) {
+      await page.click('#load-saved');
+      const again = await waitStatus(page, (tx) => /0\.5B|Q4_K|Modelo listo|1 hilo/i.test(tx) && !/Cargando|Pasando|Preparando/i.test(tx), 240000);
+      result.loadSavedAgain = again;
+      result.checks.loadSavedAgain = /0\.5B|Q4_K|1 hilo/i.test(again);
+    }
 
     // OOM error path should not freeze the UI
     await page.evaluate(() => window.__chatlmTest && window.__chatlmTest.simulateOom());
@@ -137,7 +169,34 @@ async function run(name, browserType) {
     result.uiAliveAfterOom = fileEnabled && canType;
     result.checks.uiAliveAfterOom = result.uiAliveAfterOom;
 
-    const required = ['boot','importAndLoad','streaming','generation','tokensPerSecond','stopButtonVisible','stop','oomMessage','uiAliveAfterOom'];
+    // Friendly message + auto-recover for the TinyGo resume() trap (simulated).
+    await page.evaluate(() => window.__chatlmTest && window.__chatlmTest.simulateCrash());
+    await page.waitForFunction(() => /reinicio|modelo guardado|Volviendo a cargar/i.test((document.getElementById('status') || {}).textContent || ''), { timeout: 20000 });
+    result.crashText = ((await page.locator('#status').textContent()) || '').trim();
+    result.checks.friendlyCrash = /reinicio|modelo guardado|Volviendo a cargar/i.test(result.crashText) && !/Unreachable|resume\(\)/i.test(result.crashText);
+    // Chromium should auto-load from OPFS; WebKit Linux often has no saved model.
+    await page.waitForTimeout(1500);
+    const afterCrash = ((await page.locator('#status').textContent()) || '').trim();
+    const canReload = await page.locator('#load-saved').isVisible();
+    if (/0\.5B|Q4_K|Modelo listo|1 hilo/i.test(afterCrash) && !/reinicio|Volviendo|Cargando|Pasando|Preparando/i.test(afterCrash)) {
+      result.recoveredText = afterCrash;
+      result.checks.autoRecover = true;
+    } else if (canReload || /Volviendo a cargar|Preparando|Pasando|Cargando el modelo/i.test(afterCrash)) {
+      try {
+        const recovered = await waitStatus(page, (tx) => /0\.5B|Q4_K|Modelo listo|1 hilo/i.test(tx) && !/Cargando|Pasando|Preparando|reinicio|Volviendo/i.test(tx), 240000);
+        result.recoveredText = recovered;
+        result.checks.autoRecover = true;
+      } catch (e) {
+        result.checks.autoRecover = false;
+        result.recoveredText = String(e);
+      }
+    } else {
+      result.checks.autoRecover = false;
+      result.recoveredText = afterCrash;
+    }
+
+    result.checks.noRawTrap = !logs.some((line) => /Unreachable code should not be executed/i.test(line));
+    const required = ['boot','importAndLoad','streaming','generation','tokensPerSecond','secondGeneration','stopButtonVisible','stop','friendlyCrash','oomMessage','uiAliveAfterOom'];
     result.ok = required.every((k) => result.checks[k]);
   } catch (err) {
     result.error = String(err && err.stack || err);

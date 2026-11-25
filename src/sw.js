@@ -1,4 +1,4 @@
-const CACHE = 'chatlm-v2';
+const CACHE = 'chatlm-v3';
 const ASSETS = [
   './',
   './index.html',
