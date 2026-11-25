@@ -9,7 +9,7 @@ SRC_DIR := src
 all: dist
 
 wasm:
-	tinygo build -target wasm -o $(SRC_DIR)/wasm/yzma.wasm .
+	tinygo build -target wasm -opt=2 -no-debug -stack-size=128KB -o $(SRC_DIR)/wasm/yzma.wasm .
 	cp "$(shell tinygo env TINYGOROOT)/targets/wasm_exec.js" $(SRC_DIR)/wasm/wasm_exec.js
 
 assets:

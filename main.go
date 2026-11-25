@@ -15,11 +15,12 @@ import (
 )
 
 const (
-	modelPath          = "/models/model.gguf"
-	defaultSystem      = "Sos un asistente útil. Respondé en español, de forma breve y clara."
-	nCtx               = 512
-	nBatch             = 128
-	defaultMaxTokens   = 128
+	modelPath        = "/models/model.gguf"
+	defaultSystem    = "Sos un asistente útil. Respondé en español, de forma breve y clara."
+	nCtx             = 512
+	nBatch           = 512
+	nUbatch          = 512
+	defaultMaxTokens = 128
 )
 
 type turn struct {
@@ -36,6 +37,9 @@ var (
 	history = []turn{{Role: "system", Content: defaultSystem}}
 
 	stopping atomic.Bool
+	opening  atomic.Bool
+	asking   atomic.Bool
+	loadedAt string
 )
 
 func main() {
@@ -56,7 +60,8 @@ func main() {
 	post("system", defaultSystem)
 	post("ready", backendReport())
 
-	<-make(chan struct{})
+	// Keep the runtime alive. If main returns, later resume() calls trap.
+	select {}
 }
 
 func openModel(this js.Value, args []js.Value) any {
@@ -69,9 +74,24 @@ func openModel(this js.Value, args []js.Value) any {
 }
 
 func open(path string) {
+	if asking.Load() {
+		post("error", "Esperá a que termine la respuesta, o pulsá Parar, antes de volver a cargar el modelo.")
+		return
+	}
+	if !opening.CompareAndSwap(false, true) {
+		return
+	}
+	defer opening.Store(false)
+
+	// Reloading the same file into a live instance is what often trips
+	// TinyGo's asyncify scheduler (resume() / unreachable).
+	if model != 0 && ctx != 0 && loadedAt == path {
+		post("loaded", modelLabel())
+		return
+	}
+
 	post("status", "Cargando el modelo en el motor…")
 
-	// Free a previous model if the user loads again.
 	freeSampler()
 	if ctx != 0 {
 		_ = llamawasm.Free(ctx)
@@ -81,6 +101,7 @@ func open(path string) {
 		_ = llamawasm.ModelFree(model)
 		model = 0
 	}
+	loadedAt = ""
 
 	params := llamawasm.ModelDefaultParams()
 	var err error
@@ -92,8 +113,12 @@ func open(path string) {
 	ctxParams := llamawasm.ContextDefaultParams()
 	ctxParams.NCtx = nCtx
 	ctxParams.NBatch = nBatch
+	ctxParams.NUbatch = nUbatch
+	ctxParams.NThreads = 1
 
 	if ctx, err = llamawasm.InitFromModel(model, ctxParams); err != nil {
+		_ = llamawasm.ModelFree(model)
+		model = 0
 		post("error", "No se pudo crear el contexto: "+err.Error())
 		return
 	}
@@ -101,13 +126,100 @@ func open(path string) {
 	vocab = llamawasm.ModelGetVocab(model)
 	freeSampler()
 	history = history[:1]
+	loadedAt = path
 
 	template := llamawasm.ModelChatTemplate(model, "")
 	if template == "" {
 		post("status", "Este modelo no trae plantilla de chat; las respuestas pueden ser flojas.")
 	}
 
-	post("loaded", llamawasm.ModelDesc(model)+", "+backendReport())
+	post("loaded", modelLabel())
+}
+
+func modelLabel() string {
+	desc := strings.TrimSpace(llamawasm.ModelDesc(model))
+	size := formatParams(llamawasm.ModelNParams(model))
+	arch, quant := splitDesc(desc)
+	head := strings.TrimSpace(strings.Join([]string{arch, size, quant}, " "))
+	if head == "" {
+		head = desc
+	}
+	if head == "" {
+		return backendReport()
+	}
+	return head + ", " + backendReport()
+}
+
+// splitDesc pulls architecture and quantization out of llama.cpp's
+// ModelDesc (e.g. "qwen2 1B Q4_K - Medium"). The "1B" token is a bucket,
+// not the real parameter count, so the caller replaces it with ModelNParams.
+func splitDesc(desc string) (arch, quant string) {
+	fields := strings.Fields(desc)
+	var rest []string
+	for _, f := range fields {
+		if isSizeBucket(f) {
+			continue
+		}
+		if quant == "" && isQuantToken(f) {
+			quant = f
+			continue
+		}
+		if quant != "" {
+			// Keep " - Medium" attached to the quant.
+			quant = strings.TrimSpace(quant + " " + f)
+			continue
+		}
+		rest = append(rest, f)
+	}
+	return strings.Join(rest, " "), quant
+}
+
+func isSizeBucket(f string) bool {
+	if len(f) < 2 {
+		return false
+	}
+	unit := f[len(f)-1]
+	if unit != 'B' && unit != 'M' && unit != 'b' && unit != 'm' {
+		return false
+	}
+	for _, c := range f[:len(f)-1] {
+		if c != '.' && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func isQuantToken(f string) bool {
+	s := strings.ToUpper(f)
+	if strings.HasPrefix(s, "IQ") {
+		s = s[2:]
+	} else if len(s) > 0 && (s[0] == 'Q' || s[0] == 'F' || s[0] == 'I') {
+		s = s[1:]
+	} else {
+		return false
+	}
+	return len(s) > 0 && s[0] >= '0' && s[0] <= '9'
+}
+
+func formatParams(n uint64) string {
+	if n == 0 {
+		return ""
+	}
+	if n >= 1_000_000_000 {
+		v := float64(n) / 1e9
+		if v >= 10 {
+			return fmt.Sprintf("%.0fB", v)
+		}
+		return fmt.Sprintf("%.1fB", v)
+	}
+	if n >= 100_000_000 {
+		return fmt.Sprintf("%.1fB", float64(n)/1e9)
+	}
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%dM", (n+500_000)/1_000_000)
+	}
+	return fmt.Sprintf("%d", n)
 }
 
 func makeSampler() {
@@ -166,13 +278,22 @@ func ask(this js.Value, args []js.Value) any {
 		maxTokens = int32(args[1].Int())
 	}
 
-	go func() {
-		stopping.Store(false)
+	if opening.Load() {
+		post("error", "El modelo todavía se está cargando.")
+		return nil
+	}
+	if model == 0 || ctx == 0 {
+		post("error", "Primero hay que cargar un modelo.")
+		return nil
+	}
+	if !asking.CompareAndSwap(false, true) {
+		post("error", "Ya estoy generando una respuesta.")
+		return nil
+	}
 
-		if model == 0 || ctx == 0 {
-			post("error", "Primero hay que cargar un modelo.")
-			return
-		}
+	go func() {
+		defer asking.Store(false)
+		stopping.Store(false)
 
 		history = append(history, turn{Role: "user", Content: question})
 
@@ -290,15 +411,11 @@ func post(kind, text string) {
 	fmt.Printf("%s: %s\n", kind, text)
 }
 
-// yield lets the worker handle Parar and paint the next token.
+// yield returns to the JavaScript event loop so Parar and token painting work.
+// TinyGo's wasm target uses the asyncify scheduler. A setTimeout + js.FuncOf
+// callback calls resume(); mixing that with the scheduler's go_scheduler()
+// wakeups is what surfaces as "Unreachable code ... resume()". time.Sleep
+// uses the official sleepTicks path instead.
 func yield() {
-	done := make(chan struct{})
-	var fn js.Func
-	fn = js.FuncOf(func(this js.Value, args []js.Value) any {
-		fn.Release()
-		close(done)
-		return nil
-	})
-	js.Global().Get("setTimeout").Invoke(fn, 0)
-	<-done
+	time.Sleep(time.Millisecond)
 }

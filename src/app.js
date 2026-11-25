@@ -24,6 +24,8 @@
   let streamStarted = 0;
   let streamTokens = 0;
   let workerGeneration = 0;
+  let recoveries = 0;
+  const MAX_RECOVERIES = 2;
 
   function status(text, kind) {
     statusEl.textContent = text || '';
@@ -72,9 +74,32 @@
     loadSaved.disabled = on;
   }
 
+  function esTrampaGo(text) {
+    return /Unreachable code|already exited|resume\(\)|go_scheduler|call of Value\.Get|Go program has already exited/i.test(String(text || ''));
+  }
+
   function explainCrash(event) {
-    return 'El motor se detuvo, posiblemente por falta de memoria. La interfaz sigue activa; podés importar o cargar de nuevo. ' +
-      (event && event.message ? event.message : '');
+    const raw = event && event.message ? event.message : String(event || '');
+    if (esTrampaGo(raw)) {
+      return 'El motor se detuvo. Lo reinicio y vuelvo a cargar el modelo…';
+    }
+    return 'El motor se detuvo, posiblemente por falta de memoria. La interfaz sigue activa; podés importar o cargar de nuevo.';
+  }
+
+  function recoverMotor(reason) {
+    if (recoveries >= MAX_RECOVERIES) {
+      status('El motor se detuvo de nuevo. Tocá «Cargar el modelo guardado» o importá el archivo otra vez.', 'bad');
+      modelLoaded = false;
+      sendBtn.disabled = true;
+      return;
+    }
+    recoveries += 1;
+    status(reason || 'El motor se detuvo. Lo reinicio y vuelvo a cargar el modelo…', 'bad');
+    setAnswering(false);
+    progress(0, false);
+    modelLoaded = false;
+    sendBtn.disabled = true;
+    attachWorker({ autoLoad: true });
   }
 
   function onWorkerMessage(message) {
@@ -85,6 +110,12 @@
         break;
       case 'hello':
         showSaved(message.meta);
+        if (message.autoLoad && message.meta) {
+          status('Volviendo a cargar el modelo…');
+          progress(0, true);
+          worker.postMessage({ kind: 'loadSaved' });
+          break;
+        }
         if (!modelLoaded) status('Listo. Elegí un archivo GGUF o cargá el que ya está guardado.');
         break;
       case 'progress':
@@ -101,6 +132,7 @@
         break;
       case 'loaded':
         modelLoaded = true;
+        recoveries = 0;
         progress(0, false);
         chat.hidden = false;
         sendBtn.disabled = false;
@@ -138,14 +170,25 @@
         setAnswering(false);
         progress(0, false);
         answerBubble = null;
+        if (esTrampaGo(text)) {
+          recoverMotor(explainCrash({ message: text }));
+          break;
+        }
         status(text || 'Hubo un error.', 'bad');
+        break;
+      case 'crash':
+        setAnswering(false);
+        progress(0, false);
+        answerBubble = null;
+        recoverMotor(text || explainCrash({ message: text }));
         break;
       default:
         break;
     }
   }
 
-  function attachWorker() {
+  function attachWorker(opts) {
+    const autoLoad = !!(opts && opts.autoLoad);
     const gen = ++workerGeneration;
     try { if (worker) worker.terminate(); } catch (_) {}
     worker = new Worker('./worker.js');
@@ -153,13 +196,15 @@
       if (gen !== workerGeneration) return;
       setAnswering(false);
       progress(0, false);
-      status(explainCrash(event), 'bad');
       modelLoaded = false;
       sendBtn.disabled = true;
+      recoverMotor(explainCrash(event));
     };
     worker.onmessage = (event) => {
       if (gen !== workerGeneration) return;
-      onWorkerMessage(event.data || {});
+      const data = event.data || {};
+      if (data.kind === 'hello') data.autoLoad = autoLoad;
+      onWorkerMessage(data);
     };
     worker.postMessage({ kind: 'hello' });
   }
@@ -227,6 +272,9 @@
   window.__chatlmTest = {
     simulateOom() {
       if (worker) worker.postMessage({ kind: 'simulateError', code: 'oom' });
+    },
+    simulateCrash() {
+      if (worker) worker.postMessage({ kind: 'simulateError', code: 'crash' });
     },
     restart() {
       modelLoaded = false;
